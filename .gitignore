@@ -1,0 +1,23 @@
+# Data
+data/
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Secrets (database passwords, API keys)
+.env
+*.env
+secrets.toml
+
+# Editors
+.vscode/
+.idea/
