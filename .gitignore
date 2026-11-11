@@ -1,5 +1,7 @@
 # Data
 data/
+raw_data/
+cleaned_data/
 
 # macOS
 .DS_Store
