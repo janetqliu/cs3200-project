@@ -1,6 +1,4 @@
-# CS3200 Project | Janet, Layla, Alexis, Ricky
-
-# Boston Food Establishments & 311 Data
+# CS3200 Project: Boston Food Establishments & 311 Data | Janet, Layla, Alexis, Ricky
 
 Boston data on food establishments (licenses, permits, health inspections), Michelin-listed restaurants, and 311 service requests. It is cleaned and then normalized into 24 linked 3NF tables.
 
