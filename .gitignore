@@ -2,6 +2,7 @@
 data/
 raw_data/
 cleaned_data/
+normalized/
 
 # macOS
 .DS_Store
