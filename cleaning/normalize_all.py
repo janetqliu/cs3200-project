@@ -21,16 +21,34 @@ Standardization applied everywhere:
     * Addresses parsed by one parser into number / direction / name / USPS
       suffix / unit, and linked to a shared ADDRESSES table. The address key is
       'NUMBER DIR NAME|ZIP' without the suffix, because ISD permit addresses omit it.
-    * ZIPs are 5-character strings, linked to a shared ZIP_CODES table.
+    * ZIPs are 5-character strings stored ONLY on ADDRESSES, which links to a
+      shared ZIP_CODES table. The placeholder '00000' becomes NULL.
     * Neighborhoods are title-cased, with slashed variants resolved.
     * Business names get one shared name_key for cross-source matching.
     * Phones are 10 digits; timestamps are 'YYYY-MM-DD HH:MM:SS' UTC; dates are 'YYYY-MM-DD'.
     * Coordinates are WGS84 lat/long, nulled if outside Boston.
+    * Placeholder property_id 0 becomes NULL.
+
+Deduplication:
+    * ISD locations identical apart from location_id are merged; licenses are
+      repointed to the surviving location_id.
+    * Inspections identical apart from inspection_id (same license, timestamp
+      and result) are merged; violations are repointed to the surviving
+      inspection_id.
+    * LB premises descriptions that just repeat location_comments are nulled.
+    * Columns that are entirely null after cleaning are dropped (never key
+      columns). This is data-dependent: a column can reappear if a future pull
+      populates it.
 
 3NF notes:
-    * Derived columns (flags, keys built from other columns, 24h/raw hour
-      duplicates, State Plane x/y) are dropped. The exceptions are name_key /
-      business_name_key: they are derived but kept as indexed match keys.
+    * zip_code lives only on ADDRESSES (address_id -> zip_code would otherwise
+      be a transitive dependency in every location-bearing table).
+    * Derived columns (flags, keys built from other columns, address_std,
+      24h/raw hour duplicates, State Plane x/y, 311 case_topic) are dropped.
+      The exceptions are name_key / business_name_key: they are derived but
+      kept as indexed match keys. address_std is available as a SQL view.
+    * inspection_results is split: result_code -> result_label (inspection_results),
+      result_label -> outcome (result_labels).
     * Multi-valued cells are split into child tables (LB managers, Michelin facilities).
     * Lookups get their own tables (license types, awards, results, ...).
 """
@@ -52,7 +70,7 @@ BOSTON_ZIPS = {
     "02132", "02116", "02163", "02135", "02134", "02114", "02133", "02122", "02205",
     "02199", "02118", "02110", "02128", "02125", "02124", "02126", "02113", "02129",
     "02136", "02109", "02108", "02210", "02203", "02111", "02120", "02131", "02115",
-    "02130", "02467", "02215", "02127", "02119", "02121",
+    "02130", "02467", "02215", "02127", "02119", "02121", "02201",
 }
 LAT_RANGE = (42.22, 42.41)
 LON_RANGE = (-71.20, -70.98)
@@ -97,13 +115,27 @@ def emit(name: str, df: pd.DataFrame, pk: list[str] | str | None = None):
     TABLES[name] = df.reset_index(drop=True)
 
 
+def dedupe_ids(df: pd.DataFrame, id_col: str, cols: list[str]):
+    """Merge rows that are identical on `cols` (nulls compare equal), keeping
+    the lowest id. Returns (deduped df, Series mapping dropped id -> kept id)."""
+    df = df.sort_values(id_col)
+    sep, na = "\x1f", "\x1eNA"
+    sig = df[cols[0]].astype("string").fillna(na)
+    for c in cols[1:]:
+        sig = sig + sep + df[c].astype("string").fillna(na)
+    keep = df.groupby(sig.values)[id_col].transform("min")
+    remap = pd.Series(keep.values, index=df[id_col].values)
+    remap = remap[remap.index != remap.values]
+    return df[~df[id_col].isin(remap.index)], remap
+
+
 # ===========================================================================
 # Shared standardizers
 # ===========================================================================
 
 def std_zip(s: pd.Series) -> pd.Series:
     z = s.astype("string").str.extract(r"(\d{4,5})")[0]
-    return z.str.zfill(5)
+    return z.str.zfill(5).replace("00000", pd.NA)
 
 
 def std_phone(s: pd.Series) -> pd.Series:
@@ -132,6 +164,12 @@ def std_coords(lat: pd.Series, lon: pd.Series):
     lon = pd.to_numeric(lon, errors="coerce")
     ok = lat.between(*LAT_RANGE) & lon.between(*LON_RANGE)
     return lat.where(ok).round(7), lon.where(ok).round(7)
+
+
+def std_property_id(s: pd.Series) -> pd.Series:
+    """Numeric property ID; 0 and other non-positive placeholders become NULL."""
+    n = pd.to_numeric(s, errors="coerce")
+    return n.where(n > 0).astype("Int64")
 
 
 NEIGHBORHOOD_FIXES = {"Dorchester Center": "Dorchester", "Roxbury Crossing": "Roxbury"}
@@ -285,11 +323,8 @@ class AddressRegistry:
         base = base.merge(suffix.rename("street_suffix"), on="address_key", how="left")
         base = base.sort_values("address_key").reset_index(drop=True)
         base.insert(0, "address_id", np.arange(1, len(base) + 1))
-        base["address_std"] = base.apply(
-            lambda r: " ".join(x for x in (r.street_number, r.street_direction,
-                                           r.street_name, r.street_suffix) if pd.notna(x) and x),
-            axis=1)
-        return base[["address_id", "address_key", "address_std", "street_number",
+        # address_std is derived from the parts, so it is a SQL view, not a column
+        return base[["address_id", "address_key", "street_number",
                      "street_direction", "street_name", "street_suffix", "zip_code"]]
 
 
@@ -352,22 +387,31 @@ def build_isd():
     locs["zip_code"] = std_zip(locs["zip"])
     locs["neighborhood"] = std_neighborhood(locs["city"])
     locs["latitude"], locs["longitude"] = std_coords(locs["latitude"], locs["longitude"])
-    locs["property_id"] = pd.to_numeric(locs["property_id"], errors="coerce").astype("Int64")
+    locs["property_id"] = std_property_id(locs["property_id"])
     locs["location_id"] = locs["location_id"].astype(int)
     locs = attach_address(locs, "address", "zip_code", "isd_location")
+
+    # Merge locations that are identical apart from location_id
+    # (zip_code is compared here but not emitted; it lives on addresses)
+    loc_cols = ["address_key", "street_number_end", "unit", "neighborhood",
+                "zip_code", "property_id", "latitude", "longitude"]
+    locs, loc_remap = dedupe_ids(locs, "location_id", loc_cols)
+    print(f"  merged {len(loc_remap):,} duplicate locations")
     emit("isd_locations", locs[[
         "location_id", "address_key", "street_number_end", "unit", "neighborhood",
-        "zip_code", "property_id", "latitude", "longitude"]], "location_id")
+        "property_id", "latitude", "longitude"]], "location_id")
 
-    # Licenses
+    # Licenses (repointed to surviving location IDs)
     lic["issued_at"] = std_ts(lic["issued_at"])
     lic["expires_at"] = std_ts(lic["expires_at"])
-    lic["location_id"] = lic["location_id"].astype("Int64")
+    lic["location_id"] = pd.to_numeric(lic["location_id"], errors="coerce").astype("Int64")
+    lic["location_id"] = lic["location_id"].map(
+        lambda x: loc_remap.get(x, x) if pd.notna(x) else pd.NA).astype("Int64")
     lic["name_key"] = lic["business_name"].map(name_key)
 
     # Food permits: match each permit to its ISD license, then carry the phone over
     permits["zip_code"] = std_zip(permits["zip_code"])
-    permits["property_id"] = pd.to_numeric(permits["property_id"], errors="coerce").astype("Int64")
+    permits["property_id"] = std_property_id(permits["property_id"])
     permits["name_key"] = permits["business_name"].map(name_key)
     permits["phone"] = std_phone(permits["phone"])
     xref = match_permits(permits, lic, locs)
@@ -390,24 +434,31 @@ def build_isd():
     emit("food_permits", permits[[
         "permit_id", "business_name", "dba_name", "name_key", "license_category",
         "license_status", "license_added_at", "address_key", "street_number_end", "unit",
-        "neighborhood", "zip_code", "property_id", "latitude", "longitude", "phone",
+        "neighborhood", "property_id", "latitude", "longitude", "phone",
     ]].rename(columns={"license_category": "category_code"}), "permit_id")
     xref["permit_id"] = xref.pop("record_id").astype(int)
     emit("food_permit_licenses", xref[["permit_id", "licenseno", "match_method"]], "permit_id")
 
-    # Inspection result lookup
+    # Inspection result lookups: result_code -> result_label -> outcome
     codes = sorted(insp["result"].dropna().unique())
     unknown = [c for c in codes if c not in INSPECTION_RESULTS]
     if unknown:
         print(f"  WARNING: unmapped inspection results: {unknown}")
-    emit("inspection_results", pd.DataFrame({
-        "result_code": codes,
-        "result_label": [INSPECTION_RESULTS.get(c, (c, "other"))[0] for c in codes],
-        "outcome": [INSPECTION_RESULTS.get(c, (c, "other"))[1] for c in codes],
-    }), "result_code")
+    res = pd.DataFrame([(c, *INSPECTION_RESULTS.get(c, (c, "other"))) for c in codes],
+                       columns=["result_code", "result_label", "outcome"])
+    emit("result_labels", res[["result_label", "outcome"]].drop_duplicates()
+         .sort_values("result_label"), "result_label")
+    emit("inspection_results", res[["result_code", "result_label"]], "result_code")
 
+    # Inspections: merge rows identical apart from inspection_id. Rows with no
+    # timestamp are left alone, since they can't be confirmed as duplicates.
     insp["inspection_id"] = insp["inspection_id"].astype(int)
     insp["inspected_at"] = std_ts(insp["inspected_at"])
+    dated = insp["inspected_at"].notna()
+    kept, insp_remap = dedupe_ids(insp[dated], "inspection_id",
+                                  ["licenseno", "inspected_at", "result"])
+    insp = pd.concat([kept, insp[~dated]]).sort_values("inspection_id")
+    print(f"  merged {len(insp_remap):,} duplicate inspections")
     emit("inspections", insp.rename(columns={"result": "result_code"})[
         ["inspection_id", "licenseno", "inspected_at", "result_code"]], "inspection_id")
 
@@ -418,13 +469,19 @@ def build_isd():
     vtypes.loc[~vtypes["severity_level"].isin(SEVERITY.keys()), "severity_level"] = pd.NA
     emit("violation_types", vtypes, "violation_code")
 
+    # Violations (repointed to surviving inspection IDs)
     iv["violation_id"] = iv["violation_id"].astype(int)
     iv["inspection_id"] = iv["inspection_id"].astype(int)
+    iv["inspection_id"] = (iv["inspection_id"].map(insp_remap)
+                           .fillna(iv["inspection_id"]).astype(int))
     iv["violation_at"] = std_ts(iv["violation_at"])
     iv["status_changed_at"] = std_ts(iv["status_changed_at"])
-    emit("inspection_violations", iv[[
-        "violation_id", "inspection_id", "violation_code", "violation_status",
-        "violation_at", "status_changed_at", "comments"]], "violation_id")
+    iv_cols = ["inspection_id", "violation_code", "violation_status",
+               "violation_at", "status_changed_at", "comments"]
+    before = len(iv)
+    iv = iv.sort_values("violation_id").drop_duplicates(subset=iv_cols)
+    print(f"  dropped {before - len(iv):,} violations duplicated by the inspection merge")
+    emit("inspection_violations", iv[["violation_id"] + iv_cols], "violation_id")
 
 
 def match_permits(permits: pd.DataFrame, lic: pd.DataFrame, locs: pd.DataFrame) -> pd.DataFrame:
@@ -514,6 +571,12 @@ def build_lb():
         lb[col] = std_phone(lb[f"{col}_clean"])
         lb[f"{col}_ext"] = lb[f"{col}_ext"].where(lb[col].notna())
 
+    # Premises description: drop when it just repeats location_comments
+    same = (lb["descpremadd"].astype("string") == lb["location_comments"].astype("string"))
+    same = same.fillna(False).astype(bool)
+    lb["descpremadd"] = lb["descpremadd"].where(~same)
+    print(f"  cleared {same.sum():,} premises descriptions duplicating location_comments")
+
     lb = attach_address(lb, "address", "zip_code", "licensing_board")
     emit("lb_licenses", lb[[
         "license_num", "historicallicensenum", "status", "license_type",
@@ -521,7 +584,7 @@ def build_lb():
         "business_name_key", "applicant", "opening_24h", "closing_24h", "patronsout_24h",
         "open_24_hours", "hours_note", "capacity", "comments", "location_comments",
         "descpremadd", "day_phone", "day_phone_ext", "evening_phone", "evening_phone_ext",
-        "address_key", "street_number_end", "unit", "neighborhood", "zip_code",
+        "address_key", "street_number_end", "unit", "neighborhood",
         "latitude", "longitude",
     ]].rename(columns={
         "historicallicensenum": "historical_license_num",
@@ -550,13 +613,16 @@ def build_michelin():
 
     mi["zip_code"] = std_zip(mi["zip_code"])
     mi["latitude"], mi["longitude"] = std_coords(mi["latitude"], mi["longitude"])
+    raw_phones = mi["phone"].notna().sum()
     mi["phone"] = std_phone(mi["phone"])
+    if raw_phones and mi["phone"].isna().all():
+        print(f"  WARNING: all {raw_phones} Michelin phones failed validation; check raw format")
     mi["green_star"] = std_bool(mi["green_star"])
     mi["name_key"] = mi["name"].map(name_key)
     mi = attach_address(mi, "street_address", "zip_code", "michelin")
     emit("michelin_restaurants", mi[[
         "michelin_id", "name", "name_key", "cuisine", "price", "award", "green_star",
-        "address_key", "street_number_end", "unit", "zip_code", "latitude", "longitude",
+        "address_key", "street_number_end", "unit", "latitude", "longitude",
         "phone", "website_url", "michelin_url", "description",
     ]], "michelin_id")
 
@@ -585,7 +651,8 @@ def build_311():
     team = team.rename(columns={"assigned_team": "team_name"})[["team_id", "team_name", "department_id"]]
     emit("teams", team, "team_id")
 
-    st = s[["service_name", "case_topic"]].dropna(subset=["service_name"]).drop_duplicates("service_name")
+    # case_topic is identical to service_name in this data, so it's dropped
+    st = s[["service_name"]].dropna().drop_duplicates()
     st = st.sort_values("service_name").reset_index(drop=True)
     st.insert(0, "service_type_id", np.arange(1, len(st) + 1))
     emit("service_types", st, "service_type_id")
@@ -612,6 +679,7 @@ def build_311():
         s[col] = s[col].str.extract(r"(\d+)")[0].str.zfill(2)
     for col in ["city_council_district", "fire_district"]:
         s[col] = pd.to_numeric(s[col], errors="coerce").astype("Int64")
+    # zip_code is used to filter and link addresses, but not emitted
     loc_cols = ["street_raw", "zip_code", "neighborhood", "public_works_district",
                 "city_council_district", "fire_district", "police_district", "ward",
                 "precinct", "latitude", "longitude"]
@@ -619,7 +687,7 @@ def build_311():
     loc = loc[loc[loc_cols].notna().any(axis=1)]
     loc = attach_address(loc, "street_raw", "zip_code", "311")
     emit("case_locations", loc[[
-        "case_id", "address_key", "street_number_end", "unit", "neighborhood", "zip_code",
+        "case_id", "address_key", "street_number_end", "unit", "neighborhood",
         "public_works_district", "city_council_district", "fire_district",
         "police_district", "ward", "precinct", "latitude", "longitude"]], "case_id")
 
@@ -630,15 +698,15 @@ def build_311():
 
 FOREIGN_KEYS = [
     # (table, column, ref_table, ref_column)
+    ("addresses", "zip_code", "zip_codes", "zip_code"),
     ("isd_locations", "address_id", "addresses", "address_id"),
-    ("isd_locations", "zip_code", "zip_codes", "zip_code"),
     ("isd_licenses", "category_code", "license_categories", "category_code"),
     ("isd_licenses", "location_id", "isd_locations", "location_id"),
     ("food_permits", "category_code", "license_categories", "category_code"),
     ("food_permits", "address_id", "addresses", "address_id"),
-    ("food_permits", "zip_code", "zip_codes", "zip_code"),
     ("food_permit_licenses", "permit_id", "food_permits", "permit_id"),
     ("food_permit_licenses", "licenseno", "isd_licenses", "licenseno"),
+    ("inspection_results", "result_label", "result_labels", "result_label"),
     ("inspections", "licenseno", "isd_licenses", "licenseno"),
     ("inspections", "result_code", "inspection_results", "result_code"),
     ("inspection_violations", "inspection_id", "inspections", "inspection_id"),
@@ -647,19 +715,15 @@ FOREIGN_KEYS = [
     ("lb_license_types", "alcohol_type", "lb_alcohol_types", "alcohol_type"),
     ("lb_licenses", "license_type", "lb_license_types", "license_type"),
     ("lb_licenses", "address_id", "addresses", "address_id"),
-    ("lb_licenses", "zip_code", "zip_codes", "zip_code"),
     ("lb_license_managers", "license_num", "lb_licenses", "license_num"),
     ("michelin_restaurants", "award", "michelin_awards", "award"),
     ("michelin_restaurants", "address_id", "addresses", "address_id"),
-    ("michelin_restaurants", "zip_code", "zip_codes", "zip_code"),
     ("michelin_facilities", "michelin_id", "michelin_restaurants", "michelin_id"),
     ("teams", "department_id", "departments", "department_id"),
     ("service_cases", "service_type_id", "service_types", "service_type_id"),
     ("service_cases", "team_id", "teams", "team_id"),
     ("case_locations", "case_id", "service_cases", "case_id"),
     ("case_locations", "address_id", "addresses", "address_id"),
-    ("case_locations", "zip_code", "zip_codes", "zip_code"),
-    ("addresses", "zip_code", "zip_codes", "zip_code"),
 ]
 
 
@@ -668,13 +732,29 @@ def build_shared():
     resolve_address_ids(addresses)  # swap address_key for address_id in source tables
     emit("addresses", addresses, "address_id")
 
-    zips = set()
-    for t in TABLES.values():
-        if "zip_code" in t.columns:
-            zips |= set(t["zip_code"].dropna())
+    # zip_code now lives only on addresses
+    zips = set(addresses["zip_code"].dropna())
     z = pd.DataFrame({"zip_code": sorted(zips)})
     z["in_boston"] = z["zip_code"].isin(BOSTON_ZIPS)
     emit("zip_codes", z, "zip_code")
+
+
+def drop_empty_columns():
+    """Drop columns with no non-null values. Primary and foreign key columns
+    are never dropped, so the schema's keys stay intact."""
+    print("Dropping all-null columns")
+    protected = {(t, c) for t, cols in PKS.items() for c in cols}
+    protected |= {(t, c) for t, c, _, _ in FOREIGN_KEYS}
+    protected |= {(r, rc) for _, _, r, rc in FOREIGN_KEYS}
+    dropped = 0
+    for name, t in TABLES.items():
+        empty = [c for c in t.columns if t[c].isna().all() and (name, c) not in protected]
+        if empty:
+            TABLES[name] = t.drop(columns=empty)
+            dropped += len(empty)
+            print(f"  {name}: {', '.join(empty)}")
+    if not dropped:
+        print("  none")
 
 
 def check_fks():
@@ -694,13 +774,21 @@ SQL_TYPES = {"Int64": "INTEGER", "int64": "INTEGER", "float64": "REAL",
              "boolean": "BOOLEAN", "bool": "BOOLEAN"}
 PKS = {}
 
+VIEWS = """
+-- Display form of an address, derived from its parts (kept out of the base table for 3NF)
+CREATE VIEW addresses_std AS
+SELECT a.*,
+       CONCAT_WS(' ', street_number, street_direction, street_name, street_suffix) AS address_std
+FROM addresses a;
+"""
+
 
 def write_outputs():
     os.makedirs(OUT_DIR, exist_ok=True)
     ddl = ["-- Generated by normalize_all.py\n"]
     order = ["zip_codes", "addresses", "license_categories", "isd_locations", "isd_licenses",
-             "food_permits", "food_permit_licenses", "inspection_results", "inspections",
-             "severity_levels", "violation_types", "inspection_violations",
+             "food_permits", "food_permit_licenses", "result_labels", "inspection_results",
+             "inspections", "severity_levels", "violation_types", "inspection_violations",
              "lb_alcohol_types", "lb_license_types", "lb_licenses", "lb_license_managers",
              "michelin_awards", "michelin_restaurants", "michelin_facilities",
              "departments", "teams", "service_types", "service_cases", "case_locations"]
@@ -714,6 +802,7 @@ def write_outputs():
             if tt == name:
                 cols.append(f"    FOREIGN KEY ({col}) REFERENCES {ref}({ref_col})")
         ddl.append(f"CREATE TABLE {name} (\n" + ",\n".join(cols) + "\n);\n")
+    ddl.append(VIEWS)
     with open(os.path.join(OUT_DIR, "schema.sql"), "w") as f:
         f.write("\n".join(ddl))
     print("  schema.sql")
@@ -731,7 +820,8 @@ def main():
         "zip_codes": ["zip_code"], "addresses": ["address_id"],
         "license_categories": ["category_code"], "isd_locations": ["location_id"],
         "isd_licenses": ["licenseno"], "food_permits": ["permit_id"],
-        "food_permit_licenses": ["permit_id"], "inspection_results": ["result_code"],
+        "food_permit_licenses": ["permit_id"], "result_labels": ["result_label"],
+        "inspection_results": ["result_code"],
         "inspections": ["inspection_id"], "severity_levels": ["severity_level"],
         "violation_types": ["violation_code"], "inspection_violations": ["violation_id"],
         "lb_alcohol_types": ["alcohol_type"], "lb_license_types": ["license_type"],
@@ -741,6 +831,7 @@ def main():
         "teams": ["team_id"], "service_types": ["service_type_id"],
         "service_cases": ["case_id"], "case_locations": ["case_id"],
     })
+    drop_empty_columns()
     check_fks()
     print(f"Writing to {OUT_DIR}/")
     write_outputs()
