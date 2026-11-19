@@ -1,6 +1,6 @@
 # CS3200 Project: Boston Food Establishments & 311 Data | Janet, Layla, Alexis, Ricky
 
-Boston data on food establishments (licenses, permits, health inspections), Michelin-listed restaurants, and 311 service requests. It is cleaned and then normalized into 24 linked 3NF tables.
+Boston data on food establishments (licenses, permits, health inspections), Michelin-listed restaurants, and 311 service requests. It is cleaned and then normalized into 25 linked 3NF tables.
 
 ```
 raw_data/                  original downloads
@@ -49,54 +49,63 @@ All scripts read every column as text so leading zeros survive. They also trim w
 python cleaning/normalize_all.py cleaned_data normalized
 ```
 
-The script writes 24 CSVs plus `schema.sql`, after checking that every primary key is unique and every foreign key resolves.
+The script writes 25 CSVs plus `schema.sql`, after checking that every primary key is unique and every foreign key resolves.
 
 **Standardization for joins**
 - **Addresses:** one parser handles every source's format, and every location row links to a shared `addresses` table.
   - The key is `NUMBER DIR NAME|ZIP`. It leaves out the street suffix because ISD permits omit it, and includes the ZIP because street names repeat across neighborhoods.
-- **ZIPs:** link to a shared `zip_codes` table.
+- **ZIPs:** stored only on `addresses`, which links to a shared `zip_codes` table. The placeholder `00000` becomes NULL.
 - **Business names:** one shared `name_key` (lowercase, ASCII, no punctuation, no LLC/Inc).
 - **Formats:** neighborhoods are title-cased; phones are 10 digits; timestamps are UTC; coordinates are WGS84.
 
+**Cleanup during normalization**
+- Duplicate rows are merged and references repointed to the surviving row: 8 ISD locations (licenses repointed) and 289 inspections (violations repointed).
+- Placeholder `property_id` `0` becomes NULL.
+- Licensing Board premises descriptions that just repeat `location_comments` are cleared.
+- Columns that are entirely null after cleaning are dropped (key columns are never dropped).
+
 **3NF changes**
 - Lookups moved into their own tables, and multi-valued cells split into child tables (Licensing Board managers, Michelin facilities).
-- Derived columns dropped.
-- Food permits are linked to ISD licenses through `food_permit_licenses`: 3,262 matched on name, 40 on property ID, 99 unmatched.
-- Kept on purpose: `name_key` columns as match keys, and coordinates, ZIP, and neighborhood on each location row. Records at the same address don't always agree on those values.
+- `inspection_results` is split: `result_code → result_label` stays in `inspection_results`, and `result_label → outcome` moves to `result_labels`.
+- ZIP is removed from every location table, since `address_id` already determines it.
+- Derived or redundant columns dropped, including `address_std` (available as the `addresses_std` view in `schema.sql`) and `case_topic` (identical to `service_name`).
+- Food permits are linked to ISD licenses through `food_permit_licenses`: 3,222 matched on name (2,962 name + property ID, 260 name + address), 40 on property ID alone, 99 unmatched.
+- Kept on purpose: `name_key` columns as match keys, and coordinates and neighborhood on each location row, because records at the same address don't always agree on those values.
 
 ## 4. Final tables (`normalized/`)
 
 | Table | Rows | PK | FKs / notes |
 |---|---|---|---|
 | **Shared** | | | |
-| `zip_codes` | 44 | `zip_code` | `in_boston` flag |
-| `addresses` | 39,337 | `address_id` | `zip_code`; `address_key` unique, `address_std` display form |
+| `zip_codes` | 43 | `zip_code` | `in_boston` flag |
+| `addresses` | 39,337 | `address_id` | `zip_code`; `address_key` unique; display form via the `addresses_std` view |
 | **ISD inspections & permits** | | | |
 | `license_categories` | 4 | `category_code` | FS, FT, RF, MFW |
-| `isd_locations` | 5,679 | `location_id` | `address_id`, `zip_code`; `property_id`, lat/long |
+| `isd_locations` | 5,671 | `location_id` | `address_id`; `property_id`, lat/long |
 | `isd_licenses` | 11,391 | `licenseno` | `category_code`, `location_id`; active + inactive |
-| `food_permits` | 3,361 | `permit_id` | `category_code`, `address_id`, `zip_code` |
+| `food_permits` | 3,361 | `permit_id` | `category_code`, `address_id` |
 | `food_permit_licenses` | 3,361 | `permit_id` | `licenseno`; `match_method` |
-| `inspection_results` | 20 | `result_code` | label and outcome (pass/fail/closure/admin/error) |
-| `inspections` | 223,525 | `inspection_id` | `licenseno`, `result_code` |
+| `result_labels` | 16 | `result_label` | `outcome` (pass/fail/closure/administrative/error) |
+| `inspection_results` | 20 | `result_code` | `result_label` |
+| `inspections` | 223,236 | `inspection_id` | `licenseno`, `result_code` |
 | `severity_levels` | 3 | `severity_level` | Minor / Major / Critical |
 | `violation_types` | 462 | `violation_code` | `severity_level` |
 | `inspection_violations` | 845,034 | `violation_id` | `inspection_id`, `violation_code`; Pass/Fail, comments |
 | **Licensing Board** | | | |
 | `lb_alcohol_types` | 5 | `alcohol_type` | `serves_alcohol` |
 | `lb_license_types` | 23 | `license_type` | `alcohol_type` |
-| `lb_licenses` | 2,534 | `license_num` | `license_type`, `address_id`, `zip_code`; hours, capacity |
+| `lb_licenses` | 2,534 | `license_num` | `license_type`, `address_id`; hours, capacity |
 | `lb_license_managers` | 2,548 | (`license_num`, `manager`) | |
 | **Michelin** | | | |
 | `michelin_awards` | 3 | `award` | `stars`, `is_bib_gourmand` |
-| `michelin_restaurants` | 15 | `michelin_id` | `award`, `address_id`, `zip_code` |
+| `michelin_restaurants` | 15 | `michelin_id` | `award`, `address_id` |
 | `michelin_facilities` | 21 | (`michelin_id`, `facility`) | |
 | **311** | | | |
 | `departments` | 14 | `department_id` | |
 | `teams` | 58 | `team_id` | `department_id` |
-| `service_types` | 76 | `service_type_id` | `case_topic` |
+| `service_types` | 76 | `service_type_id` | `service_name` |
 | `service_cases` | 79,999 | `case_id` | `service_type_id`, `team_id`; dates, on-time, closure |
-| `case_locations` | 79,990 | `case_id` | `address_id`, `zip_code`; districts, ward/precinct |
+| `case_locations` | 79,990 | `case_id` | `address_id`; districts, ward/precinct |
 
 Read ZIP, ward, precinct, phone, and ID columns as text.
 
@@ -104,7 +113,7 @@ Read ZIP, ward, precinct, phone, and ID columns as text.
 
 ```mermaid
 erDiagram
-  ZIP_CODES ||--o{ ADDRESSES : contains
+  ZIP_CODES |o--o{ ADDRESSES : contains
   ADDRESSES |o--o{ ISD_LOCATIONS : "located at"
   ADDRESSES |o--o{ FOOD_PERMITS : "located at"
   ADDRESSES |o--o{ LB_LICENSES : "located at"
@@ -115,6 +124,7 @@ erDiagram
   LICENSE_CATEGORIES ||--o{ FOOD_PERMITS : categorizes
   ISD_LOCATIONS ||--o{ ISD_LICENSES : houses
   ISD_LICENSES ||--o{ INSPECTIONS : receives
+  RESULT_LABELS ||--o{ INSPECTION_RESULTS : labels
   INSPECTION_RESULTS ||--o{ INSPECTIONS : "result of"
   INSPECTIONS ||--o{ INSPECTION_VIOLATIONS : cites
   VIOLATION_TYPES ||--o{ INSPECTION_VIOLATIONS : defines
@@ -135,4 +145,4 @@ erDiagram
   SERVICE_CASES ||--o| CASE_LOCATIONS : "occurs at"
 ```
 
-Every table with a ZIP also references `ZIP_CODES`; those lines are left out of the diagram for readability. `address_id` connects records across sources, and `name_key` adds a business-name match on top of it.
+`address_id` connects records across sources, and `name_key` adds a business-name match on top of it.
