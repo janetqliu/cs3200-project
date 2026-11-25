@@ -3,12 +3,20 @@
 Boston data on food establishments (licenses, permits, health inspections), Michelin-listed restaurants, and 311 service requests. It is cleaned and then normalized into 25 linked 3NF tables.
 
 ```
-raw_data/                  original downloads
-cleaning/                  cleaning scripts + normalize_all.py
-cleaned_data/              food_permits, lb_licenses, michelin_restaurants, 311_service_requests
-  food_violations/         licenses, locations, license_categories, inspections,
-                           inspection_violations, violation_types
-normalized/                final 3NF tables + schema.sql
+cs3200-project
+├── cleaning/
+│   ├── .py scripts for cleaning raw data files
+├── normalized/
+│   ├── .csv normalized data files
+├── queries/
+│   ├── .sql files for database setup
+│   ├── .sql files for analysis queries
+├── visualizations/
+│   ├── .ipynb files for creating visualizations
+├── research.md for research question ideas
+├── .gitignore
+├── requirements.txt
+├── README.md
 ```
 
 ## 1. Original datasets
